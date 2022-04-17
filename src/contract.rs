@@ -5,9 +5,12 @@ use std::{
     time::Duration,
 };
 
-use secp256k1::{Context, Signing};
 
-use serde::Deserialize;
+use async_trait::async_trait;
+use cosmwasm_std::Empty;
+use secp256k1::{All, Context, Signing};
+
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use terra_rust_api::{
     client::{tx_types::TXResultSync, wasm::Wasm},
@@ -20,63 +23,25 @@ use crate::{
     error::TerraRustScriptError,
     multisig::Multisig,
     sender::{GroupConfig, Sender},
+    traits::{ContractAPI, ContractInterface},
 };
 // https://doc.rust-lang.org/std/process/struct.Command.html
 // RUSTFLAGS='-C link-arg=-s' cargo wasm
-
-pub struct Interface<I, E, Q, M> {
-    pub init_msg: Option<I>,
-    pub execute_msg: Option<E>,
-    pub query_msg: Option<Q>,
-    pub migrate_msg: Option<M>,
+pub struct ContractInstance<T: ContractInterface + Default> {
+    // We won't have a lot of references so static ok for now.
+    pub group_config: &'static GroupConfig,
+    pub name: &'static str,
+    pub sender: Rc<Sender<All>>,
+    // Phantom data
+    interface: T,
 }
 
-impl<I, E, Q, M> Interface<I, E, Q, M> {}
-
-impl<I, E, Q, M> Default for Interface<I, E, Q, M> {
-    // Generates placeholder with type restrictions
-    fn default() -> Self {
-        Interface {
-            init_msg: None,
-            execute_msg: None,
-            query_msg: None,
-            migrate_msg: None,
-        }
-    }
-}
-
-pub struct ContractInstance<I, E, Q, M, C: Signing + Context> {
-    pub interface: Interface<I, E, Q, M>,
-    pub group_config: GroupConfig,
-    pub name: String,
-    pub sender: Rc<Sender<C>>,
-}
-
-impl<
-        I: serde::Serialize,
-        E: serde::Serialize,
-        Q: serde::Serialize,
-        M: serde::Serialize,
-        C: Signing + Context,
-    > ContractInstance<I, E, Q, M, C>
-{
-    pub fn new(
-        name: String,
-        interface: Interface<I, E, Q, M>,
-        sender: Rc<Sender<C>>,
-        group_config: GroupConfig,
-    ) -> Self {
-        ContractInstance {
-            interface,
-            group_config,
-            name,
-            sender,
-        }
-    }
-
-    pub async fn execute(
+#[async_trait(?Send)]
+impl<T: ContractInterface + Default> ContractAPI<T> for ContractInstance<T> {
+  
+    async fn execute(
         &self,
-        exec_msg: E,
+        exec_msg: &<T as ContractInterface>::E,
         coins: Vec<Coin>,
     ) -> Result<TXResultSync, TerraRustScriptError> {
         let sender = &self.sender;
@@ -128,9 +93,9 @@ impl<
         Ok(resp)
     }
 
-    pub async fn instantiate(
+    async fn instantiate(
         &self,
-        init_msg: I,
+        init_msg: &<T as ContractInterface>::I,
         admin: Option<String>,
         coins: Vec<Coin>,
     ) -> Result<TXResultSync, TerraRustScriptError> {
@@ -170,31 +135,38 @@ impl<
         Ok(resp)
     }
 
-    pub async fn query(
-        &self,
-        query_msg: Q,
-    ) -> Result<Value, TerraRustScriptError> {
+    async fn query(&self, query_msg: &<T as ContractInterface>::Q) -> Result<Value, TerraRustScriptError> {
         let sender = &self.sender;
         let json_query = json!(query_msg);
-        
+
         let wasm = Wasm::create(&sender.terra);
-        let resp:Value = wasm.query(&self.get_address()?, &json_query.to_string()).await?;
-        
+        let resp: Value = wasm
+            .query(&self.get_address()?, &json_query.to_string())
+            .await?;
+
         Ok(resp)
     }
 
-    pub async fn upload(&self, name: &str, path: Option<&str>) -> Result<TXResultSync, TerraRustScriptError> {
+    async fn upload(
+        &self,
+        name: &str,
+        path: Option<&str>,
+    ) -> Result<TXResultSync, TerraRustScriptError> {
         let sender = &self.sender;
         let wasm = Wasm::create(&sender.terra);
         let memo = format!("Contract: {}, Group: {}", self.name, self.group_config.name);
         let wasm_path = {
             match path {
                 Some(path) => path.to_string(),
-                None => format!("{}{}", env::var("WASM_DIR").unwrap(), format!("/{}.wasm",name)),
+                None => format!(
+                    "{}{}",
+                    env::var("WASM_DIR").unwrap(),
+                    format!("/{}.wasm", name)
+                ),
             }
         };
 
-        log::debug!("{}",&wasm_path);
+        log::debug!("{}", &wasm_path);
         let resp = wasm
             .store(&sender.secp, &sender.private_key, &wasm_path, Some(memo))
             .await?;
@@ -216,6 +188,20 @@ impl<
         self.save_code_id(code_id)?;
         wait(&self.group_config).await;
         Ok(resp)
+    }
+}
+
+impl<T: ContractInterface + Default> ContractInstance<T> {
+    pub fn new(name: &'static str, group_config: &'static GroupConfig, sender: &Rc<Sender<All>>) -> anyhow::Result<Self> {
+        let instance = 
+        ContractInstance {
+            group_config,
+            name,
+            sender: sender.clone(),
+            interface: T::default(),
+        };
+        instance.check_scaffold()?;
+        Ok(instance)
     }
 
     pub fn get_address(&self) -> Result<String, TerraRustScriptError> {
